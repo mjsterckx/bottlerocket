@@ -2,7 +2,7 @@
 //! and revoking access to EC2 AMIs.
 
 use crate::aws::ami::wait::{self, wait_for_ami};
-use crate::aws::ami::Image;
+use crate::aws::ami::{Image, LaunchPermissionDef};
 use crate::aws::client::build_client_config;
 use crate::aws::region_from_string;
 use crate::Args;
@@ -200,18 +200,32 @@ pub(crate) async fn run(args: &Args, publish_args: &PublishArgs) -> Result<()> {
     .await?;
 
     info!("Updating AMI permissions - {}", description);
-    let ami_ids = amis
-        .into_iter()
-        .map(|(region, image)| (region, image.id))
-        .collect();
     modify_regional_images(
         &publish_args.modify_opts,
         &operation,
-        &ami_ids,
+        &mut amis,
         &ec2_clients,
     )
     .await?;
 
+    write_amis(&publish_args.ami_input, &amis)?;
+
+    Ok(())
+}
+
+fn write_amis(ami_output: &PathBuf, amis: &HashMap<Region, Image>) -> Result<()> {
+    let file = File::create(ami_output).context(error::FileSnafu {
+        op: "write amis to file",
+        path: ami_output,
+    })?;
+    serde_json::to_writer_pretty(
+        file,
+        &amis
+            .into_iter()
+            .map(|(region, image)| (region.to_string(), image.clone()))
+            .collect::<HashMap<String, Image>>(),
+    )
+    .context(error::SerializeSnafu { path: ami_output })?;
     Ok(())
 }
 
@@ -462,11 +476,12 @@ pub(crate) async fn modify_image(
 pub(crate) async fn modify_regional_images(
     modify_opts: &ModifyOptions,
     operation: &OperationType,
-    images: &HashMap<Region, String>,
+    images: &mut HashMap<Region, Image>,
     clients: &HashMap<Region, Ec2Client>,
 ) -> Result<()> {
     let mut requests = Vec::new();
-    for (region, image_id) in images {
+    for (region, image) in &mut *images {
+        let image_id = &image.id;
         let ec2_client = &clients[region];
 
         let modify_image_future = modify_image(modify_opts, operation, image_id, ec2_client);
@@ -492,6 +507,38 @@ pub(crate) async fn modify_regional_images(
             Ok(_) => {
                 success_count += 1;
                 info!("Modified permissions of image {} in {}", image_id, region);
+
+                // Set the `public` and `launch_permissions` fields for the Image object
+                let mut image = images.get_mut(&Region::new(region.clone())).ok_or(
+                    error::Error::MissingRegion {
+                        region: region.clone(),
+                    },
+                )?;
+                if matches!(operation, OperationType::Add)
+                    && modify_opts.group_names.contains(&"all".to_string())
+                {
+                    image.public = true
+                } else if matches!(operation, OperationType::Remove)
+                    && modify_opts.group_names.contains(&"all".to_string())
+                {
+                    image.public = false
+                }
+                image.launch_permissions = clients[&Region::new(region.clone())]
+                    .describe_image_attribute()
+                    .image_id(image_id.clone())
+                    .attribute(aws_sdk_ec2::model::ImageAttributeName::LaunchPermission)
+                    .send()
+                    .await
+                    .context(error::DescribeImageAttributeSnafu {
+                        image_id: image_id.clone(),
+                        region: region.to_string(),
+                    })?
+                    .launch_permissions()
+                    .unwrap_or(&[])
+                    .to_vec()
+                    .into_iter()
+                    .map(LaunchPermissionDef::from)
+                    .collect();
             }
             Err(e) => {
                 error_count += 1;
@@ -519,7 +566,8 @@ pub(crate) async fn modify_regional_images(
 mod error {
     use crate::aws::ami;
     use aws_sdk_ec2::error::{
-        DescribeImagesError, ModifyImageAttributeError, ModifySnapshotAttributeError,
+        DescribeImageAttributeError, DescribeImagesError, ModifyImageAttributeError,
+        ModifySnapshotAttributeError,
     };
     use aws_sdk_ec2::types::SdkError;
     use snafu::Snafu;
@@ -531,6 +579,18 @@ mod error {
     pub(crate) enum Error {
         #[snafu(display("Error reading config: {}", source))]
         Config { source: pubsys_config::Error },
+
+        #[snafu(display(
+            "Failed to describe image attributes for image {} in region {}: {}",
+            image_id,
+            region,
+            source
+        ))]
+        DescribeImageAttribute {
+            image_id: String,
+            region: String,
+            source: SdkError<DescribeImageAttributeError>,
+        },
 
         #[snafu(display("Failed to describe images in {}: {}", region, source))]
         DescribeImages {
@@ -565,6 +625,9 @@ mod error {
             request_type: String,
             missing: String,
         },
+
+        #[snafu(display("Failed to find region {} in AMI map", region))]
+        MissingRegion { region: String },
 
         #[snafu(display(
             "Failed to modify permissions of {} in {}: {}",
@@ -611,6 +674,12 @@ mod error {
         #[snafu(display("DescribeImages in {} with unique filters returned multiple results: {}", region, images.join(", ")))]
         MultipleImages { region: String, images: Vec<String> },
 
+        #[snafu(display("Failed to serialize output to '{}': {}", path.display(), source))]
+        Serialize {
+            path: PathBuf,
+            source: serde_json::Error,
+        },
+
         #[snafu(display(
             "Given region(s) in Infra.toml / regions argument that are not in --ami-input file: {}",
             regions.join(", ")
@@ -633,6 +702,7 @@ mod error {
                 // look at this and decide whether or not their new error variant might have
                 // modified any AMI permissions.
                 Error::Config { .. }
+                | Error::DescribeImageAttribute { .. }
                 | Error::DescribeImages { .. }
                 | Error::Deserialize { .. }
                 | Error::File { .. }
@@ -640,10 +710,12 @@ mod error {
                 | Error::MissingConfig { .. }
                 | Error::MissingImage { .. }
                 | Error::MissingInResponse { .. }
+                | Error::MissingRegion { .. }
                 | Error::ModifyImageAttribute { .. }
                 | Error::ModifyImageAttributes { .. }
                 | Error::ModifySnapshotAttributes { .. }
                 | Error::MultipleImages { .. }
+                | Error::Serialize { .. }
                 | Error::UnknownRegions { .. }
                 | Error::WaitAmi { .. } => 0u16,
 

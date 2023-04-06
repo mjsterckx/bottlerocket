@@ -232,7 +232,7 @@ pub(crate) async fn run(args: &Args, validate_ssm_args: &ValidateSsmArgs) -> Res
     Ok(())
 }
 
-mod error {
+pub(crate) mod error {
     use crate::aws::ssm::ssm;
     use snafu::Snafu;
     use std::path::PathBuf;

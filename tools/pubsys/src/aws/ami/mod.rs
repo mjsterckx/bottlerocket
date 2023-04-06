@@ -1,17 +1,20 @@
 //! The ami module owns the 'ami' subcommand and controls the process of registering and copying
 //! EC2 AMIs.
 
+pub(crate) mod launch_permissions;
 pub(crate) mod public;
 mod register;
 mod snapshot;
 pub(crate) mod wait;
 
+use crate::aws::ami::launch_permissions::get_launch_permissions;
+use crate::aws::ami::public::ami_is_public;
 use crate::aws::publish_ami::{get_snapshots, modify_image, modify_snapshots, ModifyOptions};
 use crate::aws::{client::build_client_config, parse_arch, region_from_string};
 use crate::Args;
 use aws_sdk_ebs::Client as EbsClient;
 use aws_sdk_ec2::error::CopyImageError;
-use aws_sdk_ec2::model::{ArchitectureValues, OperationType};
+use aws_sdk_ec2::model::{ArchitectureValues, LaunchPermission, OperationType};
 use aws_sdk_ec2::output::CopyImageOutput;
 use aws_sdk_ec2::types::SdkError;
 use aws_sdk_ec2::{Client as Ec2Client, Region};
@@ -141,6 +144,10 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
         region: base_region.as_ref(),
     })?;
 
+    // If the AMI does not exist yet, `public` should be false and `launch_permissions` empty
+    let mut public = false;
+    let mut launch_permissions = vec![];
+
     let (ids_of_image, already_registered) = if let Some(found_id) = maybe_id {
         warn!(
             "Found '{}' already registered in {}: {}",
@@ -153,9 +160,25 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
                 region: base_region.as_ref(),
             })?;
         let found_ids = RegisteredIds {
-            image_id: found_id,
+            image_id: found_id.clone(),
             snapshot_ids,
         };
+
+        public = ami_is_public(&base_ec2_client, base_region.as_ref(), &found_id)
+            .await
+            .context(error::IsAmiPublicSnafu {
+                image_id: found_id.clone(),
+                region: base_region.to_string(),
+            })?;
+
+        launch_permissions =
+            get_launch_permissions(&base_ec2_client, base_region.as_ref(), &found_id)
+                .await
+                .context(error::DescribeImageAttributeSnafu {
+                    image_id: found_id,
+                    region: base_region.to_string(),
+                })?;
+
         (found_ids, true)
     } else {
         let new_ids = register_image(ami_args, &base_region, base_ebs_client, &base_ec2_client)
@@ -174,7 +197,12 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
 
     amis.insert(
         base_region.as_ref().to_string(),
-        Image::new(&ids_of_image.image_id, &ami_args.name),
+        Image::new(
+            &ids_of_image.image_id,
+            &ami_args.name,
+            Some(public),
+            Some(launch_permissions),
+        ),
     );
 
     // If we don't need to copy AMIs, we're done.
@@ -294,7 +322,25 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
                 "Found '{}' already registered in {}: {}",
                 ami_args.name, region, id
             );
-            amis.insert(region.as_ref().to_string(), Image::new(&id, &ami_args.name));
+            let public = ami_is_public(&ec2_clients[&region], region.as_ref(), &id)
+                .await
+                .context(error::IsAmiPublicSnafu {
+                    image_id: id.clone(),
+                    region: base_region.to_string(),
+                })?;
+
+            let launch_permissions =
+                get_launch_permissions(&ec2_clients[&region], region.as_ref(), &id)
+                    .await
+                    .context(error::DescribeImageAttributeSnafu {
+                        region: region.as_ref(),
+                        image_id: id.clone(),
+                    })?;
+
+            amis.insert(
+                region.as_ref().to_string(),
+                Image::new(&id, &ami_args.name, Some(public), Some(launch_permissions)),
+            );
             continue;
         }
 
@@ -346,7 +392,7 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
                     );
                     amis.insert(
                         region.as_ref().to_string(),
-                        Image::new(&image_id, &ami_args.name),
+                        Image::new(&image_id, &ami_args.name, Some(false), Some(vec![])),
                     );
                 } else {
                     saw_error = true;
@@ -372,6 +418,40 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
     Ok(amis)
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq, Hash)]
+pub(crate) struct LaunchPermissionDef {
+    /// The name of the group
+    pub group: Option<String>,
+
+    /// The Amazon Web Services account ID
+    pub user_id: Option<String>,
+
+    /// The ARN of an organization
+    pub organization_arn: Option<String>,
+
+    /// The ARN of an organizational unit
+    pub organizational_unit_arn: Option<String>,
+}
+
+impl From<LaunchPermission> for LaunchPermissionDef {
+    fn from(launch_permission: LaunchPermission) -> Self {
+        Self {
+            group: launch_permission
+                .group()
+                .map(|group| group.as_str().to_owned()),
+            user_id: launch_permission
+                .user_id()
+                .map(|user_id| user_id.to_owned()),
+            organization_arn: launch_permission
+                .organization_arn()
+                .map(|organization_arn| organization_arn.to_owned()),
+            organizational_unit_arn: launch_permission
+                .organizational_unit_arn()
+                .map(|organizational_unit_arn| organizational_unit_arn.to_owned()),
+        }
+    }
+}
+
 /// If JSON output was requested, we serialize out a mapping of region to AMI information; this
 /// struct holds the information we save about each AMI.  The `ssm` subcommand uses this
 /// information to populate templates representing SSM parameter names and values.
@@ -379,13 +459,22 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
 pub(crate) struct Image {
     pub(crate) id: String,
     pub(crate) name: String,
+    pub(crate) public: Option<bool>,
+    pub(crate) launch_permissions: Option<Vec<LaunchPermissionDef>>,
 }
 
 impl Image {
-    fn new(id: &str, name: &str) -> Self {
+    fn new(
+        id: &str,
+        name: &str,
+        public: Option<bool>,
+        launch_permissions: Option<Vec<LaunchPermissionDef>>,
+    ) -> Self {
         Self {
             id: id.to_string(),
             name: name.to_string(),
+            public,
+            launch_permissions,
         }
     }
 }
@@ -447,6 +536,8 @@ mod error {
     use snafu::Snafu;
     use std::path::PathBuf;
 
+    use super::public;
+
     #[derive(Debug, Snafu)]
     #[snafu(visibility(pub(super)))]
     pub(crate) enum Error {
@@ -455,6 +546,18 @@ mod error {
 
         #[snafu(display("Error reading config: {}", source))]
         Config { source: pubsys_config::Error },
+
+        #[snafu(display(
+            "Failed to describe image attributes for image {} in region {}: {}",
+            image_id,
+            region,
+            source
+        ))]
+        DescribeImageAttribute {
+            image_id: String,
+            region: String,
+            source: super::launch_permissions::Error,
+        },
 
         #[snafu(display("Failed to create file '{}': {}", path.display(), source))]
         FileCreate {
@@ -500,6 +603,18 @@ mod error {
             thing: String,
             region: String,
             source: SdkError<ModifyImageAttributeError>,
+        },
+
+        #[snafu(display(
+            "Failed to check if AMI with id {} is public in {}: {}",
+            image_id,
+            region,
+            source
+        ))]
+        IsAmiPublic {
+            image_id: String,
+            region: String,
+            source: public::Error,
         },
 
         #[snafu(display("Infra.toml is missing {}", missing))]
